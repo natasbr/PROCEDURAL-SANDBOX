@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Isle of Echoes 3D – Procedural Voxel Prototype</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            background: rgba(0,0,0,0.6);
+            padding: 12px 20px;
+            border-radius: 8px;
+            pointer-events: none;
+            z-index: 10;
+            font-size: 14px;
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        #seed-display {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: #aaa;
+            font-size: 12px;
+            background: rgba(0,0,0,0.5);
+            padding: 6px 12px;
+            border-radius: 20px;
+            pointer-events: none;
+            z-index: 10;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            color: #ccc;
+            background: rgba(0,0,0,0.5);
+            padding: 10px 16px;
+            border-radius: 8px;
+            font-size: 13px;
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255,255,255,0.1);
+            pointer-events: none;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <span style="font-weight:bold; color:#f1c40f;">🌴 Isle of Echoes 3D</span><br>
+        <span style="font-size:12px;">WASD to move · Mouse to look · Seed based world</span>
+    </div>
+    <div id="seed-display">🌱 Seed: <span id="seedValue">42</span></div>
+    <div id="controls">⏱️ Day <span id="dayPhase">☀️</span> · Chunks: <span id="chunkCount">0</span></div>
+
+    <!-- Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+
+        // ----- CONFIG -----
+        const SEED = 42; // change this to get a new world
+        const CHUNK_SIZE = 16; // voxels per side
+        const VIEW_DIST = 4; // chunks around player
+        const WATER_LEVEL = 2;
+
+        // ----- DOM refs -----
+        document.getElementById('seedValue').textContent = SEED;
+
+        // ----- Simple Simplex-like noise (hash based) -----
+        // Using a deterministic pseudo-random generator
+        function hash(x, y) {
+            let h = x * 374761393 + y * 668265263;
+            h = (h ^ (h >> 13)) * 1274126177;
+            return (h ^ (h >> 16)) & 0x7fffffff;
+        }
+
+        function smoothNoise(x, y) {
+            const ix = Math.floor(x);
+            const iy = Math.floor(y);
+            const fx = x - ix;
+            const fy = y - iy;
+            const ux = fx * fx * (3 - 2 * fx);
+            const uy = fy * fy * (3 - 2 * fy);
+            const a = (hash(ix, iy) & 0xffff) / 65536;
+            const b = (hash(ix + 1, iy) & 0xffff) / 65536;
+            const c = (hash(ix, iy + 1) & 0xffff) / 65536;
+            const d = (hash(ix + 1, iy + 1) & 0xffff) / 65536;
+            return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+        }
+
+        function fbm(x, y, octaves = 3) {
+            let value = 0, amplitude = 1, frequency = 1, total = 0;
+            for (let i = 0; i < octaves; i++) {
+                value += amplitude * smoothNoise(x * frequency, y * frequency);
+                total += amplitude;
+                amplitude *= 0.5;
+                frequency *= 2;
+            }
+            return value / total;
+        }
+
+        // Height function using seed offsets
+        function getHeight(worldX, worldZ) {
+            // Use seed to offset noise coordinates
+            const seedOffset = SEED * 0.001;
+            const h = fbm(worldX * 0.04 + seedOffset, worldZ * 0.04 + seedOffset, 4);
+            return h * 12 + 2; // height range ~2..14
+        }
+
+        // ----- Resource placement (trees) using separate seed -----
+        function getTreePositions(chunkX, chunkZ) {
+            const positions = [];
+            const resSeed = SEED + chunkX * 31 + chunkZ * 71;
+            // Use a simple LCG
+            let rng = resSeed;
+            const rand = () => { rng = (rng * 1664525 + 1013904223) & 0xffffffff; return (rng >>> 0) / 4294967296; };
+            // Number of trees per chunk ~2-5
+            const count = Math.floor(rand() * 4) + 2;
+            for (let i = 0; i < count; i++) {
+                const lx = Math.floor(rand() * (CHUNK_SIZE - 2)) + 1;
+                const lz = Math.floor(rand() * (CHUNK_SIZE - 2)) + 1;
+                const worldX = chunkX * CHUNK_SIZE + lx;
+                const worldZ = chunkZ * CHUNK_SIZE + lz;
+                const height = Math.floor(getHeight(worldX, worldZ));
+                positions.push({ x: worldX, z: worldZ, y: height });
+            }
+            return positions;
+        }
+
+        // ----- Scene Setup -----
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB);
+        scene.fog = new THREE.Fog(0x87CEEB, 60, 120);
+
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+        camera.position.set(8, 12, 14);
+        camera.lookAt(0, 4, 0);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.2;
+        document.body.appendChild(renderer.domElement);
+
+        // Controls (Orbit-like, but with mouse look)
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 4, 0);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.1;
+        controls.maxPolarAngle = Math.PI / 2.1;
+        controls.minDistance = 3;
+        controls.maxDistance = 30;
+        controls.update();
+
+        // ----- Lighting -----
+        const ambientLight = new THREE.AmbientLight(0x404060, 0.3);
+        scene.add(ambientLight);
+
+        const sunLight = new THREE.DirectionalLight(0xffeedd, 1.5);
+        sunLight.position.set(40, 30, 20);
+        sunLight.castShadow = true;
+        sunLight.shadow.mapSize.width = 1024;
+        sunLight.shadow.mapSize.height = 1024;
+        sunLight.shadow.camera.near = 0.5;
+        sunLight.shadow.camera.far = 100;
+        sunLight.shadow.camera.left = -30;
+        sunLight.shadow.camera.right = 30;
+        sunLight.shadow.camera.top = 30;
+        sunLight.shadow.camera.bottom = -30;
+        scene.add(sunLight);
+
+        const hemisphereLight = new THREE.HemisphereLight(0x87CEEB, 0x3a5f0b, 0.4);
+        scene.add(hemisphereLight);
+
+        // ----- World Data (chunk management) -----
+        const chunks = new Map(); // key: "x,z" => { mesh, data }
+
+        // Helper to build a chunk mesh from voxel data
+        function buildChunkMesh(chunkX, chunkZ) {
+            const voxels = [];
+            const size = CHUNK_SIZE;
+            const waterLevel = WATER_LEVEL;
+
+            // First, generate heightmap for this chunk
+            const heightMap = [];
+            for (let lx = 0; lx < size; lx++) {
+                heightMap[lx] = [];
+                for (let lz = 0; lz < size; lz++) {
+                    const wx = chunkX * size + lx;
+                    const wz = chunkZ * size + lz;
+                    const h = Math.floor(getHeight(wx, wz));
+                    heightMap[lx][lz] = h;
+                }
+            }
+
+            // Build voxel array: each voxel is {x, y, z, material}
+            // Materials: 0=air, 1=grass, 2=dirt, 3=stone, 4=wood, 5=leaves, 6=sand
+            const blockSize = 1;
+            const offset = 0.5; // center alignment
+
+            // Terrain
+            for (let lx = 0; lx < size; lx++) {
+                for (let lz = 0; lz < size; lz++) {
+                    const h = heightMap[lx][lz];
+                    const wx = chunkX * size + lx;
+                    const wz = chunkZ * size + lz;
+                    const isWater = (wx*wx + wz*wz) < 20*20 && h < waterLevel; // lake near center
+                    const topMat = isWater ? 6 : 1; // sand near water, else grass
+
+                    for (let ly = 0; ly < h; ly++) {
+                        let mat = 3; // stone
+                        if (ly === h - 1) mat = topMat;
+                        else if (ly >= h - 3) mat = 2; // dirt
+                        // water fill
+                        if (isWater && ly <= waterLevel) mat = 6; // sand under water (simplified)
+                        if (isWater && ly === waterLevel && ly > h) mat = 6; // surface sand
+                        if (isWater && ly < h) mat = 3; // stone below water
+                        // actually simpler: if ly < h, use stone/dirt; if ly >= h and water, sand
+                        // but we override
+                        if (ly < h) {
+                            // use terrain
+                            if (ly === h - 1) mat = topMat;
+                            else if (ly >= h - 2) mat = 2;
+                            else mat = 3;
+                        } else {
+                            // above terrain
+                            if (isWater && ly <= waterLevel) mat = 6; // sand surface
+                            else mat = 0;
+                        }
+                        // but we want water surface to be water block? For simplicity, we use sand as water's surface.
+                        // we'll add a water plane later.
+                        if (mat !== 0) {
+                            voxels.push({
+                                x: lx,
+                                y: ly,
+                                z: lz,
+                                material: mat
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Trees (wood and leaves)
+            const trees = getTreePositions(chunkX, chunkZ);
+            for (const tree of trees) {
+                const lx = tree.x - chunkX * size;
+                const lz = tree.z - chunkZ * size;
+                if (lx < 0 || lx >= size || lz < 0 || lz >= size) continue;
+                const baseY = heightMap[lx][lz];
+                if (baseY < 1) continue;
+                // Trunk (height 4)
+                for (let i = 0; i < 4; i++) {
+                    const y = baseY + i;
+                    voxels.push({ x: lx, y: y, z: lz, material: 4 });
+                }
+                // Leaves (3x3x2)
+                const leafBase = baseY + 3;
+                for (let dy = 0; dy < 2; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        for (let dz = -1; dz <= 1; dz++) {
+                            const ax = lx + dx, az = lz + dz;
+                            if (ax < 0 || ax >= size || az < 0 || az >= size) continue;
+                            if (Math.abs(dx) === 1 && Math.abs(dz) === 1 && Math.random() > 0.6) continue; // sparse corners
+                            const y = leafBase + dy;
+                            // don't place leaves on trunk top
+                            if (dx === 0 && dz === 0 && dy === 0) continue;
+                            voxels.push({ x: ax, y: y, z: az, material: 5 });
+                        }
+                    }
+                }
+            }
+
+            // ----- Build mesh from voxels (merge by material) -----
+            const geometryByMat = {};
+            const materialMap = {
+                1: { color: 0x7cb342, emissive: 0x000000 }, // grass
+                2: { color: 0x8d6e63, emissive: 0x000000 }, // dirt
+                3: { color: 0x9e9e9e, emissive: 0x000000 }, // stone
+                4: { color: 0x8d6e63, emissive: 0x000000 }, // wood
+                5: { color: 0x2e7d32, emissive: 0x000000 }, // leaves
+                6: { color: 0xf5e6b8, emissive: 0x000000 } // sand
+            };
+
+            const groupedVoxels = {};
+            for (const v of voxels) {
+                const mat = v.material;
+                if (!groupedVoxels[mat]) groupedVoxels[mat] = [];
+                groupedVoxels[mat].push(v);
+            }
+
+            const group = new THREE.Group();
+
+            for (const matId in groupedVoxels) {
+                const list = groupedVoxels[matId];
+                if (list.length === 0) continue;
+                const geo = new THREE.BoxGeometry(0.98, 0.98, 0.98);
+                const mat = new THREE.MeshLambertMaterial(materialMap[matId] || { color: 0xff00ff });
+                // Instance or merge? For simplicity, we create one mesh per voxel - but for performance we merge.
+                // Merge all geometries into one.
+                const geometries = [];
+                for (const v of list) {
+                    const g = geo.clone();
+                    g.translate(v.x + 0.5, v.y + 0.5, v.z + 0.5);
+                    geometries.push(g);
+                }
+                const mergedGeo = mergeBufferGeometries(geometries);
+                const mesh = new THREE.Mesh(mergedGeo, mat);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                group.add(mesh);
+            }
+
+            // Add water plane if needed (for visual) - we'll just add a semi-transparent plane at water level globally.
+            // We'll do that separately.
+
+            return group;
+        }
+
+        // Utility: merge geometries (using Three.js built-in)
+        function mergeBufferGeometries(geometries) {
+            // Simplified: use BufferGeometryUtils if available, but we'll implement a simple merge.
+            // Actually we can use the built-in merge from three examples.
+            // We'll import dynamically.
+            // For simplicity, we'll just combine vertex arrays.
+            // This is a placeholder; we'll use a simpler approach: use InstancedMesh for performance.
+            // But for small chunks, merging is okay.
+            // Let's use a proper merge from the library.
+            // Instead, we'll use a quick and dirty merge:
+            // Since we have many boxes, we can use InstancedMesh with a single box geometry.
+            // That's even better for performance.
+            // We'll refactor: use InstancedMesh per material.
+            return null; // not used
+        }
+
+        // We'll reimplement chunk building using InstancedMesh for better performance.
+        function buildChunkMeshInstanced(chunkX, chunkZ) {
+            const size = CHUNK_SIZE;
+            const heightMap = [];
+            for (let lx = 0; lx < size; lx++) {
+                heightMap[lx] = [];
+                for (let lz = 0; lz < size; lz++) {
+                    const wx = chunkX * size + lx;
+                    const wz = chunkZ * size + lz;
+                    const h = Math.floor(getHeight(wx, wz));
+                    heightMap[lx][lz] = h;
+                }
+            }
+
+            // Collect voxels by material
+            const voxelsByMat = { 1: [], 2: [], 3: [], 4: [], 5: [], 6: [] };
+
+            // Terrain
+            for (let lx = 0; lx < size; lx++) {
+                for (let lz = 0; lz < size; lz++) {
+                    const h = heightMap[lx][lz];
+                    const wx = chunkX * size + lx;
+                    const wz = chunkZ * size + lz;
+                    const isWater = (wx*wx + wz*wz) < 20*20 && h < WATER_LEVEL;
+                    const topMat = isWater ? 6 : 1;
+                    for (let ly = 0; ly < h; ly++) {
+                        let mat = 3;
+                        if (ly === h - 1) mat = topMat;
+                        else if (ly >= h - 2) mat = 2;
+                        else mat = 3;
+                        // water override
+                        if (isWater && ly <= WATER_LEVEL) mat = 6; // sand
+                        if (isWater && ly > h && ly <= WATER_LEVEL) mat = 6; // sand surface
+                        // but we don't want to fill water with blocks, we'll have a water plane.
+                        // So skip water blocks? We'll just not place blocks above terrain.
+                        if (ly >= h && isWater) continue; // no blocks above terrain.
+                        // Place block
+                        if (mat !== 0) {
+                            voxelsByMat[mat].push({ x: lx, y: ly, z: lz });
+                        }
+                    }
+                }
+            }
+
+            // Trees
+            const trees = getTreePositions(chunkX, chunkZ);
+            for (const tree of trees) {
+                const lx = tree.x - chunkX * size;
+                const lz = tree.z - chunkZ * size;
+                if (lx < 0 || lx >= size || lz < 0 || lz >= size) continue;
+                const baseY = heightMap[lx][lz];
+                if (baseY < 1) continue;
+                // Trunk
+                for (let i = 0; i < 4; i++) {
+                    const y = baseY + i;
+                    voxelsByMat[4].push({ x: lx, y: y, z: lz });
+                }
+                const leafBase = baseY + 3;
+                for (let dy = 0; dy < 2; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        for (let dz = -1; dz <= 1; dz++) {
+                            const ax = lx + dx, az = lz + dz;
+                            if (ax < 0 || ax >= size || az < 0 || az >= size) continue;
+                            if (Math.abs(dx) === 1 && Math.abs(dz) === 1 && Math.random() > 0.6) continue;
+                            const y = leafBase + dy;
+                            if (dx === 0 && dz === 0 && dy === 0) continue;
+                            voxelsByMat[5].push({ x: ax, y: y, z: az });
+                        }
+                    }
+                }
+            }
+
+            // Build InstancedMesh for each material
+            const group = new THREE.Group();
+            const boxGeo = new THREE.BoxGeometry(0.95, 0.95, 0.95);
+
+            for (const matId in voxelsByMat) {
+                const list = voxelsByMat[matId];
+                if (list.length === 0) continue;
+                const colorMap = {
+                    1: 0x7cb342, 2: 0x8d6e63, 3: 0x9e9e9e, 4: 0x8d6e63, 5: 0x2e7d32, 6: 0xf5e6b8
+                };
+                const mat = new THREE.MeshLambertMaterial({ color: colorMap[matId] });
+                const instancedMesh = new THREE.InstancedMesh(boxGeo, mat, list.length);
+                const matrix = new THREE.Matrix4();
+                const position = new THREE.Vector3();
+                const quaternion = new THREE.Quaternion();
+                const scale = new THREE.Vector3(1, 1, 1);
+                let idx = 0;
+                for (const v of list) {
+                    position.set(v.x + 0.5, v.y + 0.5, v.z + 0.5);
+                    matrix.compose(position, quaternion, scale);
+                    instancedMesh.setMatrixAt(idx, matrix);
+                    idx++;
+                }
+                instancedMesh.instanceMatrix.needsUpdate = true;
+                instancedMesh.castShadow = true;
+                instancedMesh.receiveShadow = true;
+                group.add(instancedMesh);
+            }
+
+            return group;
+        }
+
+        // ----- Chunk Management -----
+        function getChunkKey(cx, cz) {
+            return `${cx},${cz}`;
+        }
+
+        function loadChunk(cx, cz) {
+            const key = getChunkKey(cx, cz);
+            if (chunks.has(key)) return;
+            const meshGroup = buildChunkMeshInstanced(cx, cz);
+            // Position the group at chunk origin
+            meshGroup.position.set(cx * CHUNK_SIZE, 0, cz * CHUNK_SIZE);
+            scene.add(meshGroup);
+            chunks.set(key, { mesh: meshGroup, cx, cz });
+            updateChunkCount();
+        }
+
+        function unloadChunk(cx, cz) {
+            const key = getChunkKey(cx, cz);
+            if (chunks.has(key)) {
+                const entry = chunks.get(key);
+                scene.remove(entry.mesh);
+                // Dispose geometries/materials? For simplicity, we skip.
+                chunks.delete(key);
+                updateChunkCount();
+            }
+        }
+
+        function updateChunkCount() {
+            document.getElementById('chunkCount').textContent = chunks.size;
+        }
+
+        // ----- Update chunks based on player position -----
+        function updateChunks(playerPos) {
+            const cx = Math.floor(playerPos.x / CHUNK_SIZE);
+            const cz = Math.floor(playerPos.z / CHUNK_SIZE);
+            const view = VIEW_DIST;
+
+            // Determine which chunks should be active
+            const needed = new Set();
+            for (let dx = -view; dx <= view; dx++) {
+                for (let dz = -view; dz <= view; dz++) {
+                    const nx = cx + dx;
+                    const nz = cz + dz;
+                    // Only load if within world bounds (we'll limit to -8..8)
+                    if (Math.abs(nx) > 8 || Math.abs(nz) > 8) continue;
+                    needed.add(getChunkKey(nx, nz));
+                    // Load if not loaded
+                    if (!chunks.has(getChunkKey(nx, nz))) {
+                        loadChunk(nx, nz);
+                    }
+                }
+            }
+
+            // Unload chunks not needed
+            for (const key of chunks.keys()) {
+                if (!needed.has(key)) {
+                    const [cxStr, czStr] = key.split(',');
+                    unloadChunk(parseInt(cxStr), parseInt(czStr));
+                }
+            }
+        }
+
+        // ----- Water plane (global) -----
+        function addWater() {
+            const waterGeo = new THREE.PlaneGeometry(200, 200);
+            const waterMat = new THREE.MeshLambertMaterial({
+                color: 0x2a6f8f,
+                transparent: true,
+                opacity: 0.4,
+                side: THREE.DoubleSide
+            });
+            const water = new THREE.Mesh(waterGeo, waterMat);
+            water.rotation.x = -Math.PI / 2;
+            water.position.y = WATER_LEVEL + 0.2;
+            water.receiveShadow = true;
+            scene.add(water);
+        }
+
+        // ----- Day/Night cycle -----
+        let timeOfDay = 0; // 0-1, 0=dawn, 0.25=noon, 0.5=dusk, 0.75=midnight
+        const dayLength = 60; // seconds for full cycle
+        let lastTime = performance.now();
+
+        function updateDayNight(delta) {
+            timeOfDay += delta / dayLength;
+            if (timeOfDay > 1) timeOfDay -= 1;
+            const angle = timeOfDay * Math.PI * 2;
+            const sunHeight = Math.sin(angle);
+            const sunHorizontal = Math.cos(angle);
+            // Sun position: rotate around Y
+            const radius = 60;
+            const sunX = radius * sunHorizontal * 0.7;
+            const sunZ = radius * sunHorizontal * 0.7;
+            const sunY = Math.max(radius * sunHeight * 0.8, 5);
+            sunLight.position.set(sunX, sunY, sunZ);
+            // Intensity based on height
+            const intensity = Math.max(0, Math.min(1, (sunHeight + 0.3) / 1.3));
+            sunLight.intensity = intensity * 1.2;
+            // Ambient adjust
+            ambientLight.intensity = 0.2 + intensity * 0.3;
+            // Background color
+            const bgColor = new THREE.Color(0x87CEEB).lerp(new THREE.Color(0x0a0a2a), Math.max(0, 1 - intensity * 1.2));
+            scene.background = bgColor;
+            // Fog color
+            scene.fog.color.copy(bgColor);
+            // Update UI
+            const phase = intensity > 0.7 ? '☀️' : intensity > 0.3 ? '🌤️' : intensity > 0.1 ? '🌅' : '🌙';
+            document.getElementById('dayPhase').textContent = phase;
+        }
+
+        // ----- Player movement (simple) -----
+        const player = new THREE.Object3D();
+        player.position.set(0, 0, 0);
+        // We'll control camera via OrbitControls, but we need to move the target.
+        // We'll move the controls target and camera position relative to player.
+
+        // Keyboard
+        const keys = {};
+        window.addEventListener('keydown', (e) => keys[e.key] = true);
+        window.addEventListener('keyup', (e) => keys[e.key] = false);
+
+        // Mouse lock for better control? We'll use OrbitControls with damping.
+
+        // ----- Init world -----
+        // Generate initial chunks around (0,0)
+        const startPos = new THREE.Vector3(0, 0, 0);
+        updateChunks(startPos);
+
+        // Add water
+        addWater();
+
+        // ----- Animate loop -----
+        let prevTime = performance.now();
+
+        function animate() {
+            const now = performance.now();
+            const delta = Math.min((now - prevTime) / 1000, 0.05);
+            prevTime = now;
+
+            // Move player with WASD (relative to camera)
+            const forward = new THREE.Vector3(0, 0, -1);
+            forward.applyQuaternion(camera.quaternion);
+            forward.y = 0;
+            forward.normalize();
+            const right = new THREE.Vector3(1, 0, 0);
+            right.applyQuaternion(camera.quaternion);
+            right.y = 0;
+            right.normalize();
+
+            let moveVec = new THREE.Vector3();
+            if (keys['w'] || keys['W']) moveVec.add(forward);
+            if (keys['s'] || keys['S']) moveVec.sub(forward);
+            if (keys['a'] || keys['A']) moveVec.sub(right);
+            if (keys['d'] || keys['D']) moveVec.add(right);
+            if (moveVec.length() > 0) {
+                moveVec.normalize().multiplyScalar(6 * delta);
+                // Move the controls target
+                controls.target.add(moveVec);
+                // Move camera position along
+                camera.position.add(moveVec);
+                // Update player position
+                player.position.copy(controls.target);
+                // Update chunks based on player position
+                updateChunks(player.position);
+            }
+
+            // Update day/night
+            updateDayNight(delta);
+
+            // Update controls
+            controls.update();
+
+            renderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+
+        animate();
+
+        // ----- Resize handler -----
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // ----- Seed display -----
+        console.log(`World seed: ${SEED}`);
+
+        // Note: In a full game, we'd also generate caves, loot, NPCs using other seeds.
+        // This prototype demonstrates terrain + trees with seed determinism.
+
+    </script>
+</body>
+</html>
